@@ -1,8 +1,10 @@
 import serial, time, math, atexit, signal
 import multiprocessing as mp
-import multiprocessing.shared_memory
+from multiprocessing import shared_memory as mp_shared_memory
+from multiprocessing.synchronize import Event, Lock
 import numpy as np
 # import pygame # Imported in main to prevent re-import in child process
+
 PORT = "COM15"
 BAUDRATE = 460800
 WHITE = (255, 255, 255)
@@ -50,7 +52,7 @@ class RPLidar:
 
         self.shm = self.create_shared_memory(SHM_NAME, self.BUFFER_SIZE)
 
-        self.data = np.ndarray(BUFFER_SHAPE, dtype=DTYPE, buffer=self.shm.buf)
+        self.data: np.ndarray[tuple[int, int], np.dtype[np.float32]] = np.ndarray(BUFFER_SHAPE, dtype=DTYPE, buffer=self.shm.buf)
 
         self.lock = mp.Lock()
         self.shut_down_event = mp.Event()
@@ -63,22 +65,22 @@ class RPLidar:
 
     def create_shared_memory(self, name: str, size: int):
         try:
-            shm = mp.shared_memory.SharedMemory(name=name, create=True, size=size)
+            shm = mp_shared_memory.SharedMemory(name=name, create=True, size=size)
         except FileExistsError:
-            shm = mp.shared_memory.SharedMemory(name=name)
+            shm = mp_shared_memory.SharedMemory(name=name)
             shm.close()
             shm.unlink()
-            shm = mp.shared_memory.SharedMemory(name=name, create=True, size=size)
+            shm = mp_shared_memory.SharedMemory(name=name, create=True, size=size)
         return shm
 
     @staticmethod
-    def serial_reader(name: str, lock, shut_down_event, data_stream_active_event):
+    def serial_reader(name: str, lock: Lock, shut_down_event: Event, data_stream_active_event: Event):
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         parent = mp.parent_process()
-        shm = mp.shared_memory.SharedMemory(name=name, create=False)
-        data = np.ndarray(BUFFER_SHAPE, DTYPE, buffer=shm.buf)
-        ser = None
-        index = 0
+        shm = mp_shared_memory.SharedMemory(name=name, create=False)
+        data: np.ndarray[tuple[int, int], np.dtype[np.float32]] = np.ndarray(BUFFER_SHAPE, DTYPE, buffer=shm.buf)
+        ser: serial.Serial | None = None
+        index: int = 0
         incoming_bytes = bytearray()
         try: # Ensures clean shutdown if error occurs
             while not shut_down_event.is_set() and (parent is None or parent.is_alive()): # continously read serial
@@ -102,57 +104,56 @@ class RPLidar:
 
                     data_stream_active_event.set()
 
-                if ser is not None:
-                    try:
-                        b = ser.read(4096) # Read all data available (Chunking to improve speed)
-                        # print(b)
-                    except serial.SerialException as e:
-                        print("ERROR READING SERIAL:", e)
-                        RPLidar.close_serial(ser)
-                        ser = None
-                        print("Serial port disconnected")
-                        incoming_bytes = bytearray()
-                        b = bytes()
-                        print("Deleted stored bytes")
-                        print("Attempting to reconnect...")
+                try:
+                    b = ser.read(4096) # Read all data available (Chunking to improve speed)
+                    # print(b)
+                except serial.SerialException as e:
+                    print("ERROR READING SERIAL:", e)
+                    RPLidar.close_serial(ser)
+                    ser = None
+                    print("Serial port disconnected")
+                    incoming_bytes = bytearray()
+                    b = bytes()
+                    print("Deleted stored bytes")
+                    print("Attempting to reconnect...")
+                
+                incoming_bytes += b
+                while len(incoming_bytes) >= 5:
+                    # Decode and validate packet
+                    # TODO: Optimize/correct order of checks
+                    if (incoming_bytes[0] & 0x01) == ((incoming_bytes[0] >> 1) & 0x01):
+                        del incoming_bytes[0]
+                        print("Invalid Packet: Matching inverse start bits")
+                        continue
                     
-                    incoming_bytes += b
-                    while len(incoming_bytes) >= 5:
-                        # Decode and validate packet
-                        # TODO: Optimize/correct order of checks
-                        if (incoming_bytes[0] & 0x01) == ((incoming_bytes[0] >> 1) & 0x01):
-                            del incoming_bytes[0]
-                            print("Invalid Packet: Matching inverse start bits")
-                            continue
-                        
-                        if incoming_bytes[1] & 0x01 == 0:
-                            del incoming_bytes[0]
-                            print("Invalid Packet: Check bit invalid")
-                            continue
+                    if incoming_bytes[1] & 0x01 == 0:
+                        del incoming_bytes[0]
+                        print("Invalid Packet: Check bit invalid")
+                        continue
 
-                        quality = int(incoming_bytes[0] >> 2)
-                        # if quality == 0:
-                        #     del incoming_bytes[:5]
-                        #     print("Skipped over 0 quality reading")
-                        #     continue
-                        
-                        angle = float((incoming_bytes[1] >> 1) | (incoming_bytes[2] << 7)) / 64
-                        if angle >= 360:
-                            del incoming_bytes[0]
-                            print(f"Invalid Packet: Angle ({angle:.3f}) >= 360 degrees")
-                            continue
-                        
-                        distance = float((incoming_bytes[3]) | (incoming_bytes[4] << 8))/4
-                        if (distance < 30 or distance > 12_000) and distance != 0:
-                            print(f"WARNING: Distance ({distance:.3f}) is out of expected range (50-2,000)")
-                        
+                    quality = int(incoming_bytes[0] >> 2)
+                    # if quality == 0:
+                    #     del incoming_bytes[:5]
+                    #     print("Skipped over 0 quality reading")
+                    #     continue
+                    
+                    angle = float((incoming_bytes[1] >> 1) | (incoming_bytes[2] << 7)) / 64
+                    if angle >= 360:
+                        del incoming_bytes[0]
+                        print(f"Invalid Packet: Angle ({angle:.3f}) >= 360 degrees")
+                        continue
+                    
+                    distance = float((incoming_bytes[3]) | (incoming_bytes[4] << 8))/4
+                    if (distance < 30 or distance > 12_000) and distance != 0:
+                        print(f"WARNING: Distance ({distance:.3f}) is out of expected range (50-12,000)")
+                    
 
-                        # Add data to buffer
-                        with lock:
-                            data[index] = (quality, angle, distance)
-                        index += 1
-                        index %= data.shape[0]
-                        del incoming_bytes[:5]
+                    # Add data to buffer
+                    with lock:
+                        data[index] = (quality, angle, distance)
+                    index += 1
+                    index %= data.shape[0]
+                    del incoming_bytes[:5]
 
                     time.sleep(0.01)
         except Exception as e:
@@ -162,7 +163,7 @@ class RPLidar:
             shm.close()
     
     @staticmethod
-    def close_serial(ser):
+    def close_serial(ser: serial.Serial | None):
         if ser is not None and ser.is_open:
             ser.write(b"\xA5\x25")
             print("Stopped the LIDAR")
@@ -197,7 +198,7 @@ class RPLidar:
         else:
             print("Process gracefully ended")
 
-def main(lidar):
+def main(lidar: RPLidar):
     import pygame
     pygame.init()
     screen = pygame.display.set_mode((window_size, window_size), pygame.SCALED)
