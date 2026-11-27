@@ -116,7 +116,7 @@ class RPLidar:
                     b = bytes()
                     print("Deleted stored bytes")
                     print("Attempting to reconnect...")
-                
+
                 incoming_bytes += b
                 while len(incoming_bytes) >= 5:
                     # Decode and validate packet
@@ -125,7 +125,7 @@ class RPLidar:
                         del incoming_bytes[0]
                         print("Invalid Packet: Matching inverse start bits")
                         continue
-                    
+
                     if incoming_bytes[1] & 0x01 == 0:
                         del incoming_bytes[0]
                         print("Invalid Packet: Check bit invalid")
@@ -136,17 +136,17 @@ class RPLidar:
                     #     del incoming_bytes[:5]
                     #     print("Skipped over 0 quality reading")
                     #     continue
-                    
+
                     angle = float((incoming_bytes[1] >> 1) | (incoming_bytes[2] << 7)) / 64
                     if angle >= 360:
                         del incoming_bytes[0]
                         print(f"Invalid Packet: Angle ({angle:.3f}) >= 360 degrees")
                         continue
-                    
+
                     distance = float((incoming_bytes[3]) | (incoming_bytes[4] << 8))/4
                     if (distance < 30 or distance > 12_000) and distance != 0:
                         print(f"WARNING: Distance ({distance:.3f}) is out of expected range (50-12,000)")
-                    
+
 
                     # Add data to buffer
                     with lock:
@@ -155,13 +155,13 @@ class RPLidar:
                     index %= data.shape[0]
                     del incoming_bytes[:5]
 
-                    time.sleep(0.01)
+                time.sleep(0.01)
         except Exception as e:
             print("UNEXPECTED ERROR:", e)
         finally:
             RPLidar.close_serial(ser)
             shm.close()
-    
+
     @staticmethod
     def close_serial(ser: serial.Serial | None):
         if ser is not None and ser.is_open:
@@ -176,7 +176,7 @@ class RPLidar:
     def get_data(self):
         with self.lock:
             return self.data.copy()
-    
+
     def free_shared_memory(self):
         if self.shm is not None:
             self.shm.close()
