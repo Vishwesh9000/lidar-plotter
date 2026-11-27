@@ -13,8 +13,6 @@ GREEN = (0, 255, 0)
 RED = (255, 0, 0)
 
 BACKGROUND_COLOR = BLACK
-CIRCLE_COLOR = GREEN
-CIRCLE_RAD = 2
 
 SCALING_FACTOR = 0.1
 
@@ -26,6 +24,10 @@ DTYPE = np.float32
 screen = None
 
 window_size = 800
+
+grid_subdivisions = 100
+grid_length_mm = 10_000 # mm
+
 
 class RPLidar:
     # RPLIDAR Packet sytax:
@@ -50,9 +52,10 @@ class RPLidar:
     def __init__(self):
         self.BUFFER_SIZE = int(np.prod(BUFFER_SHAPE) * np.dtype(DTYPE).itemsize)
 
-        self.shm = self.create_shared_memory(SHM_NAME, self.BUFFER_SIZE)
+        self.shm: mp_shared_memory.SharedMemory | None = self.create_shared_memory(SHM_NAME, self.BUFFER_SIZE)
 
         self.data: np.ndarray[tuple[int, int], np.dtype[np.float32]] = np.ndarray(BUFFER_SHAPE, dtype=DTYPE, buffer=self.shm.buf)
+        self.data.fill(0)
 
         self.lock = mp.Lock()
         self.shut_down_event = mp.Event()
@@ -61,7 +64,13 @@ class RPLidar:
         self.proc = mp.Process(target=RPLidar.serial_reader, args=(self.shm.name, self.lock, self.shut_down_event, self.data_stream_active_event))
         self.proc.start()
 
-        atexit.register(self.free_shared_memory)
+        atexit.register(self.free_shared_memory) # Just in case, even though context manager handles it
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args: object):
+        self.stop_process()
+        self.free_shared_memory()
 
     def create_shared_memory(self, name: str, size: int):
         try:
@@ -116,7 +125,7 @@ class RPLidar:
                     b = bytes()
                     print("Deleted stored bytes")
                     print("Attempting to reconnect...")
-                
+
                 incoming_bytes += b
                 while len(incoming_bytes) >= 5:
                     # Decode and validate packet
@@ -125,43 +134,42 @@ class RPLidar:
                         del incoming_bytes[0]
                         print("Invalid Packet: Matching inverse start bits")
                         continue
-                    
+
                     if incoming_bytes[1] & 0x01 == 0:
                         del incoming_bytes[0]
                         print("Invalid Packet: Check bit invalid")
                         continue
 
                     quality = int(incoming_bytes[0] >> 2)
-                    # if quality == 0:
-                    #     del incoming_bytes[:5]
-                    #     print("Skipped over 0 quality reading")
-                    #     continue
-                    
+
                     angle = float((incoming_bytes[1] >> 1) | (incoming_bytes[2] << 7)) / 64
                     if angle >= 360:
                         del incoming_bytes[0]
                         print(f"Invalid Packet: Angle ({angle:.3f}) >= 360 degrees")
                         continue
-                    
+
                     distance = float((incoming_bytes[3]) | (incoming_bytes[4] << 8))/4
                     if (distance < 30 or distance > 12_000) and distance != 0:
                         print(f"WARNING: Distance ({distance:.3f}) is out of expected range (50-12,000)")
-                    
+
 
                     # Add data to buffer
+                    # TODO: Move lock out of tight loop
                     with lock:
                         data[index] = (quality, angle, distance)
                     index += 1
                     index %= data.shape[0]
                     del incoming_bytes[:5]
 
-                    time.sleep(0.01)
+            time.sleep(0.01)
         except Exception as e:
             print("UNEXPECTED ERROR:", e)
         finally:
+            print("Process shutting down...")
             RPLidar.close_serial(ser)
             shm.close()
-    
+            print("Process gracefully ended")
+
     @staticmethod
     def close_serial(ser: serial.Serial | None):
         if ser is not None and ser.is_open:
@@ -176,7 +184,7 @@ class RPLidar:
     def get_data(self):
         with self.lock:
             return self.data.copy()
-    
+
     def free_shared_memory(self):
         if self.shm is not None:
             self.shm.close()
@@ -184,7 +192,7 @@ class RPLidar:
             self.shm = None
             print("Freed shared memory")
 
-    def stop(self):
+    def stop_process(self):
         print("Stopping lidar monitoring...")
         self.shut_down_event.set()
 
@@ -195,15 +203,18 @@ class RPLidar:
             self.proc.terminate()
             self.proc.join()
             print("Process didn't respond. Process forcefully shut down")
-        else:
-            print("Process gracefully ended")
 
 def main(lidar: RPLidar):
     import pygame
     pygame.init()
     screen = pygame.display.set_mode((window_size, window_size), pygame.SCALED)
+    grid_surface = pygame.Surface((grid_subdivisions, grid_subdivisions), depth=24)
     pygame.display.set_caption("LIDAR C1 Stream Viewer")
     pygame.draw.circle(screen, RED, (window_size/2, window_size/2), 5)
+
+    grid: np.ndarray[tuple[int, int], np.dtype[np.float32]] = np.zeros((grid_subdivisions, grid_subdivisions), np.float32) # [y, x] ordering; top left is [0,0]; values: 0-1
+    rgba: np.ndarray[tuple[int, int, int], np.dtype[np.uint8]] = np.zeros((grid_subdivisions, grid_subdivisions, 4), np.uint8)
+
     running = True
     while running:
         for event in pygame.event.get():
@@ -214,18 +225,34 @@ def main(lidar: RPLidar):
         data = lidar.get_data()
         for quality, angle, distance in data:
             quality, angle, distance = float(quality), float(angle), float(distance)
-            x = math.cos(math.radians(90-angle))*distance*SCALING_FACTOR + window_size/2
-            y = -math.sin(math.radians(90-angle))*distance*SCALING_FACTOR + window_size/2 # y axis points downward
+            if distance == 0 or quality == 0:
+                continue
 
-            pygame.draw.circle(screen, CIRCLE_COLOR, (x, y), CIRCLE_RAD)
+            x = math.cos(math.radians(90-angle))*distance
+            y = -math.sin(math.radians(90-angle))*distance # y axis points downward
+
+            i_x: int = math.floor(x*grid_subdivisions/grid_length_mm + grid_subdivisions/2)
+            i_y: int = math.floor(y*grid_subdivisions/grid_length_mm + grid_subdivisions/2)
+            if i_x in range(grid_subdivisions) and i_y in range(grid_subdivisions):
+                grid[i_y, i_x] = 1
+
+        # pygame.display.flip()
+        # time.sleep(0.5)
+        rgba[:,:,:3] = (grid[:,:,None] * 255).astype(np.uint8)
+        rgba[:,:,3] = 255
+        grid_surface = pygame.image.frombuffer(rgba.tobytes(), (grid_subdivisions, grid_subdivisions), "RGBA")
+        pygame.transform.scale(grid_surface, (window_size, window_size), screen)
+        pygame.draw.circle(screen, RED, (window_size/2, window_size/2), 5)
+        grid *= .8
+        grid[grid < 0.02] = 0
+
+
         pygame.display.flip()
-        time.sleep(0.5)
+        time.sleep(0.2)
 
 if __name__ == "__main__":
-    lidar = RPLidar()
-    try:
-        main(lidar)
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt intercepted. Shutting down program")
-    finally:
-        lidar.stop()
+    with RPLidar() as lidar:
+        try:
+            main(lidar)
+        except KeyboardInterrupt:
+            print("KeyboardInterrupt intercepted. Shutting down program")
