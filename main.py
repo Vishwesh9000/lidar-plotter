@@ -98,12 +98,13 @@ class RPLidar:
                     try: # Try to reconnect and catch SerialException if failed
                         ser = serial.Serial(port=PORT, baudrate=BAUDRATE, timeout=0)
 
-                        # TODO: Move reset commands out of try?
-                        # ser.write(b"\xA5\x40")
-                        # time.sleep(1)
+                        ser.write(b"\xA5\x25")
+                        time.sleep(.2)
                         ser.reset_input_buffer()
                         ser.write(b"\xA5\x20")
                         time.sleep(0.1)
+                        # Catch 7-byte descriptor on startup: "A5 5A 05 00 00 40 81"
+                        ser.read(7)
 
                     except serial.SerialException:
                         print(f"Unable to connect to {PORT}. Retrying...")
@@ -125,43 +126,55 @@ class RPLidar:
                     b = bytes()
                     print("Deleted stored bytes")
                     print("Attempting to reconnect...")
+                    continue
 
                 incoming_bytes += b
-                while len(incoming_bytes) >= 5:
+                batch: list[tuple[float, float, float]] = []
+                byte_index = 0
+                while byte_index + 5 <= len(incoming_bytes):
                     # Decode and validate packet
-                    # TODO: Optimize/correct order of checks
-                    if (incoming_bytes[0] & 0x01) == ((incoming_bytes[0] >> 1) & 0x01):
-                        del incoming_bytes[0]
+                    if (incoming_bytes[byte_index + 0] & 0x01) == ((incoming_bytes[byte_index + 0] >> 1) & 0x01):
+                        byte_index += 1
                         print("Invalid Packet: Matching inverse start bits")
                         continue
 
-                    if incoming_bytes[1] & 0x01 == 0:
-                        del incoming_bytes[0]
+                    if incoming_bytes[byte_index + 1] & 0x01 == 0:
+                        byte_index += 1
                         print("Invalid Packet: Check bit invalid")
                         continue
 
-                    quality = int(incoming_bytes[0] >> 2)
+                    quality = int(incoming_bytes[byte_index + 0] >> 2)
 
-                    angle = float((incoming_bytes[1] >> 1) | (incoming_bytes[2] << 7)) / 64
+                    angle = float((incoming_bytes[byte_index + 1] >> 1) | (incoming_bytes[byte_index + 2] << 7)) / 64
                     if angle >= 360:
-                        del incoming_bytes[0]
+                        byte_index += 1
                         print(f"Invalid Packet: Angle ({angle:.3f}) >= 360 degrees")
                         continue
 
-                    distance = float((incoming_bytes[3]) | (incoming_bytes[4] << 8))/4
+                    distance = float((incoming_bytes[byte_index + 3]) | (incoming_bytes[byte_index + 4] << 8))/4
                     if (distance < 30 or distance > 12_000) and distance != 0:
                         print(f"WARNING: Distance ({distance:.3f}) is out of expected range (50-12,000)")
 
 
-                    # Add data to buffer
-                    # TODO: Move lock out of tight loop
-                    with lock:
-                        data[index] = (quality, angle, distance)
-                    index += 1
-                    index %= data.shape[0]
-                    del incoming_bytes[:5]
+                    # Chunk data in local buffer to avoid aquiring lock in a tight loop
+                    batch.append((quality, angle, distance))
+                    byte_index += 5
 
-            time.sleep(0.01)
+                if batch:
+                    n = len(batch)
+                    if n >= BUFFER_SHAPE[0]:
+                        batch = batch[-BUFFER_SHAPE[0]:] # Don't need to consider the length of deleted points because alignment is arbitary
+                        n = len(batch)
+                    with lock:
+                        if index + n > BUFFER_SHAPE[0]:
+                            data[index:] = batch[ : BUFFER_SHAPE[0]-index]
+                            data[:index+n-BUFFER_SHAPE[0]] = batch[BUFFER_SHAPE[0]-index : ]
+                        else:
+                            data[index:index+n] = batch
+                    index = (index + n) % BUFFER_SHAPE[0]
+
+                del incoming_bytes[:byte_index]
+                time.sleep(0.01)
         except Exception as e:
             print("UNEXPECTED ERROR:", e)
         finally:
@@ -182,6 +195,7 @@ class RPLidar:
         return self.data_stream_active_event.is_set()
 
     def get_data(self):
+        """Returns the 700 most recent points in circular buffer order (chronological except across the wrap-around seam; arbitrary start angle)."""
         with self.lock:
             return self.data.copy()
 
